@@ -1,0 +1,13 @@
+{
+  "name": "Inksync",
+  "short_name": "Inksync",
+  "description": "Read a PDF on your PC and annotate it live from your phone.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#16181d",
+  "theme_color": "#16181d",
+  "icons": [
+    { "src": "/img/logo-mark.png", "sizes": "96x96", "type": "image/png" },
+    { "src": "/img/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

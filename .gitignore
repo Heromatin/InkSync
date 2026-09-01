@@ -1,0 +1,16 @@
+# runtime data: uploaded PDFs, upload metadata, annotation/camera sidecars
+docs/
+
+# python
+__pycache__/
+*.pyc
+
+# virtualenv
+.venv/
+
+# node
+node_modules/
+*.log
+
+# OS noise
+.DS_Store

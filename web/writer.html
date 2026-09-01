@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Inksync — Writer</title>
+<link rel="icon" type="image/png" href="/img/favicon.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="toolbar" id="toolbar">
+  <img class="brand-mark" src="/img/logo-mark.png" alt="Inksync" title="Inksync">
+  <button id="tool-pen" class="active">✏️ Pen</button>
+  <button id="tool-highlight">🖍️ Highlighter</button>
+  <button id="tool-eraser">🧽 Eraser</button>
+  <div class="swatches" id="swatches"></div>
+  <button id="undo">↩ Undo</button>
+  <span class="spacer"></span>
+  <button id="zoomout">−</button>
+  <span id="zoomlabel" style="font-size:13px;color:var(--dim)">200%</span>
+  <button id="zoomin">+</button>
+  <button id="follow" class="active">Following</button>
+</div>
+<div id="scroller"></div>
+<div class="status-pill" id="status" hidden></div>
+
+<script type="module">
+import { PdfViewer } from "/static/js/pdf-core.js";
+import { SyncClient, uuid } from "/static/js/sync.js";
+import { loadPdfSource } from "/static/js/idb-cache.js";
+import { drawSegment, hitTest } from "/static/js/strokes.js";
+
+const docId = location.pathname.split("/").pop();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
+const scroller = document.getElementById("scroller");
+const viewer = new PdfViewer(scroller);
+const sync = new SyncClient();
+sync.role = "writer";
+
+const COLORS = ["#1a1a1a", "#d62828", "#1d4ed8", "#059669"];
+const PEN_WIDTH = 2.2;
+const HL_WIDTH = 16;
+
+let tool = "pen";
+let color = COLORS[0];
+let following = true;
+let lastRemoteCam = null;
+
+// ------------------------------------------------------------------ state
+
+let strokes = [];
+
+function applyRemoteStroke(s) {
+  const i = strokes.findIndex(x => x.id === s.id || x.tmpId === s.tmpId);
+  if (i >= 0) strokes[i] = s; else strokes.push(s);
+  viewer.redrawPage(s.page);
+}
+
+sync.on("state", ({ strokes: incoming, camera }) => {
+  strokes = incoming;
+  viewer.strokes = strokes;
+  viewer.redrawAllOverlays();
+  if (camera && camera.p) {
+    lastRemoteCam = camera;
+    if (following) viewer.setCamera(camera);
+  }
+});
+
+sync.on("stroke", applyRemoteStroke);
+
+sync.on("erase", (ids) => {
+  const set = new Set(ids);
+  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
+  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
+});
+
+sync.on("camera", (cam) => {
+  lastRemoteCam = cam;
+  if (following && cam.p) viewer.setCamera(cam);
+});
+
+viewer.addEventListener("usercamera", (e) => {
+  // always broadcast where we are so the PC can follow
+  sync.sendCameraThrottled(e.detail);
+});
+
+// ------------------------------------------------------------------ toolbar
+
+const swatchesEl = document.getElementById("swatches");
+for (const c of COLORS) {
+  const b = document.createElement("button");
+  b.className = "swatch" + (c === color ? " active" : "");
+  b.style.background = c;
+  b.onclick = () => {
+    color = c;
+    for (const el of swatchesEl.children) el.classList.toggle("active", el === b);
+  };
+  swatchesEl.appendChild(b);
+}
+
+function setTool(t) {
+  tool = t;
+  document.getElementById("tool-pen").classList.toggle("active", t === "pen");
+  document.getElementById("tool-highlight").classList.toggle("active", t === "highlight");
+  document.getElementById("tool-eraser").classList.toggle("active", t === "eraser");
+}
+document.getElementById("tool-pen").onclick = () => setTool("pen");
+document.getElementById("tool-highlight").onclick = () => setTool("highlight");
+document.getElementById("tool-eraser").onclick = () => setTool("eraser");
+
+document.getElementById("undo").onclick = () => {
+  const mine = [...strokes].reverse().find(s => s.author === sync.clientId || !s.author);
+  if (!mine) return;
+  strokes = strokes.filter(s => s !== mine);
+  viewer.strokes = strokes;
+  viewer.redrawPage(mine.page);
+  sync.undo();
+};
+
+document.getElementById("zoomin").onclick = () => viewer.zoomBy(1.25);
+document.getElementById("zoomout").onclick = () => viewer.zoomBy(1 / 1.25);
+viewer.addEventListener("scalechange", () => {
+  document.getElementById("zoomlabel").textContent = Math.round(viewer.scale * 100) + "%";
+});
+
+const followBtn = document.getElementById("follow");
+followBtn.onclick = () => {
+  if (!following && lastRemoteCam) {
+    viewer.setCamera(lastRemoteCam);
+  }
+  setFollowing(!following);
+};
+function setFollowing(v) {
+  following = v;
+  followBtn.classList.toggle("active", v);
+  followBtn.textContent = v ? "Following" : "Free pan";
+}
+
+// ------------------------------------------------------------------ input
+//
+// Gesture state machine (touch is the primary input):
+//   idle    : nothing down
+//   draw    : exactly one pointer -> draws with the current tool
+//   gesture : exactly two pointers -> intent classified from the first
+//             movement, then LOCKED for the rest of the gesture:
+//               fingers move together, distance ~constant  -> PAN
+//               distance changes                           -> PINCH
+//   inert   : a gesture ended with a finger still down; that finger does
+//             nothing until every pointer is lifted
+//
+// Mouse and stylus go through the same single-pointer path (draw/erase).
+// A touch landing while a stylus is in use is treated as a palm and ignored.
+
+const pointers = new Map();   // pointerId -> {x,y,type}
+let drawing = null;           // {pointerId, page, stroke}
+let erasing = null;           // pointerId owning the erase gesture
+let gesture = null;           // see startGesture/updateGesture
+let inert = false;
+let penLastSeen = 0;          // for stylus palm rejection
+let gestureFrame = 0;         // rAF coalescing for gesture updates
+
+const GESTURE_THRESHOLD = 10; // css px of movement before classifying intent
+
+const firstTwo = () => [...pointers.values()].slice(0, 2);
+
+function beginSingle(e) {
+  if (tool === "eraser") {
+    erasing = e.pointerId;
+    eraseAt(e);
+    return;
+  }
+  const pt = viewer.pointToPage(e.clientX, e.clientY);
+  if (!pt) return;
+  drawing = {
+    pointerId: e.pointerId,
+    page: pt.p.index,
+    stroke: {
+      tmpId: uuid().slice(0, 8),
+      page: pt.p.index,
+      mode: tool,
+      color,
+      width: tool === "highlight" ? HL_WIDTH : PEN_WIDTH,
+      points: [{ x: pt.x, y: pt.y, p: e.pointerType === "touch" ? 0.5 : (e.pressure || 0.5) }],
+    },
+  };
+}
+
+// discard a partial stroke (1->2 finger transition) and clean its live ink
+function cancelPartial() {
+  if (drawing) {
+    const page = drawing.page;
+    drawing = null;
+    viewer.redrawPage(page);
+  }
+  erasing = null;
+}
+
+function startGesture() {
+  const [a, b] = firstTwo();
+  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  gesture = {
+    d0: Math.max(Math.hypot(a.x - b.x, a.y - b.y), 1),
+    mid0: mid,
+    lastMid: mid,
+    scale0: viewer.scale,
+    anchor: viewer.pointToPage(mid.x, mid.y),
+    mode: "undecided",   // "pan" | "pinch" once classified
+  };
+  if (following) setFollowing(false);   // manual pan detaches the phone
+}
+
+// scroll such that page point `pt` lands at client coords (cx, cy)
+function centerOn(pt, cx, cy) {
+  const wr = pt.p.wrap.getBoundingClientRect();
+  const px = wr.left + pt.x * viewer.scale;
+  const py = wr.top + pt.y * viewer.scale;
+  viewer._suppressUntil = Date.now() + 300;
+  scroller.scrollLeft += px - cx;
+  scroller.scrollTop += py - cy;
+}
+
+function updateGesture() {
+  const [a, b] = firstTwo();
+  if (!gesture || !a || !b) return;
+  const d = Math.hypot(a.x - b.x, a.y - b.y);
+  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+
+  // classify once, from the first significant movement, then stay locked
+  if (gesture.mode === "undecided") {
+    const distDelta = Math.abs(d - gesture.d0);
+    const midDelta = Math.hypot(mid.x - gesture.mid0.x, mid.y - gesture.mid0.y);
+    if (Math.max(distDelta, midDelta) < GESTURE_THRESHOLD) return;  // dead zone
+    gesture.mode = distDelta > midDelta ? "pinch" : "pan";
+  }
+
+  if (gesture.mode === "pan") {
+    // pure local scroll: content follows the fingers, no re-render, no zoom
+    viewer._suppressUntil = Date.now() + 300;
+    scroller.scrollLeft -= mid.x - gesture.lastMid.x;
+    scroller.scrollTop -= mid.y - gesture.lastMid.y;
+  } else {
+    // pinch: zoom around the finger midpoint (local, settle-rendered)
+    if (d > 0) viewer.setScale(gesture.scale0 * (d / gesture.d0));
+    if (gesture.anchor) centerOn(gesture.anchor, mid.x, mid.y);
+  }
+  gesture.lastMid = mid;
+}
+
+function scheduleGestureUpdate() {
+  if (gestureFrame) return;
+  gestureFrame = requestAnimationFrame(() => {
+    gestureFrame = 0;
+    updateGesture();
+  });
+}
+
+scroller.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  if (e.pointerType === "pen") penLastSeen = Date.now();
+
+  if (inert) return;   // wait for every finger to lift before a new gesture
+
+  // palm rejection: a touch while the stylus is in use is a palm
+  if (e.pointerType === "touch" &&
+      (Date.now() - penLastSeen < 500 ||
+       [...pointers.values()].some(p => p.type === "pen"))) return;
+
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+  scroller.setPointerCapture(e.pointerId);
+
+  if (pointers.size === 2) {
+    cancelPartial();       // 1 -> 2 transition: no stroke from the first finger
+    startGesture();
+  } else if (pointers.size === 1) {
+    beginSingle(e);        // one finger / stylus / mouse: draw or erase
+  }
+  // pointers.size > 2: extra fingers are ignored; the first two stay the pair
+}, { passive: false });
+
+scroller.addEventListener("pointermove", (e) => {
+  const rec = pointers.get(e.pointerId);
+  if (!rec) return;
+  if (e.pointerType === "pen") penLastSeen = Date.now();
+  rec.x = e.clientX;
+  rec.y = e.clientY;
+
+  if (inert) return;
+  if (gesture) { scheduleGestureUpdate(); return; }
+
+  if (drawing && e.pointerId === drawing.pointerId) {
+    const pt = viewer.pointToPage(e.clientX, e.clientY);
+    if (!pt || pt.p.index !== drawing.page) return;
+    const pts = drawing.stroke.points;
+    const last = pts[pts.length - 1];
+    if (Math.hypot(pt.x - last.x, pt.y - last.y) < 0.4) return;
+    pts.push({ x: pt.x, y: pt.y, p: e.pointerType === "touch" ? 0.5 : (e.pressure || 0.5) });
+    const ctx = viewer.strokeCtx(drawing.page);
+    if (!ctx) return;
+    drawSegment(ctx, drawing.stroke, last, pts[pts.length - 1]);
+  } else if (erasing === e.pointerId) {
+    eraseAt(e);
+  }
+});
+
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+
+  if (drawing && e.pointerId === drawing.pointerId) {
+    const s = drawing.stroke;
+    drawing = null;
+    strokes.push(s);
+    viewer.strokes = strokes;
+    viewer.redrawPage(s.page);
+    sync.sendStroke(s);
+  }
+  if (erasing === e.pointerId) erasing = null;
+
+  if (gesture && pointers.size < 2) {
+    gesture = null;
+    // publish the final camera so the PC follows the pan
+    const cam = viewer.getCamera();
+    if (cam) sync.send({ t: "camera", ...cam });
+    if (pointers.size > 0) inert = true;   // remaining finger must not draw
+  }
+  if (pointers.size === 0) inert = false;
+}
+scroller.addEventListener("pointerup", endPointer);
+scroller.addEventListener("pointercancel", endPointer);
+
+// block browser gesture UI on the canvas area (long-press menu etc.)
+scroller.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ------------------------------------------------------------------ eraser
+
+function eraseAt(e) {
+  const pt = viewer.pointToPage(e.clientX, e.clientY);
+  if (!pt) return;
+  const radius = 14 / viewer.scale;
+  const hits = strokes.filter(s => s.page === pt.p.index && hitTest(s, pt.x, pt.y, radius));
+  if (!hits.length) return;
+  const ids = hits.map(s => s.id).filter(Boolean);
+  for (const h of hits) {
+    strokes.splice(strokes.indexOf(h), 1);
+    if (h.tmpId && !ids.includes(h.id)) ids.push(h.tmpId);
+  }
+  viewer.strokes = strokes;
+  viewer.redrawPage(pt.p.index);
+  if (ids.length) sync.sendErase(ids);
+}
+
+// ------------------------------------------------------------------ misc
+
+const status = document.getElementById("status");
+sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
+
+async function wakeLock() {
+  try { await navigator.wakeLock.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") wakeLock();
+});
+
+const { data } = await loadPdfSource(docId);   // local cache first, network once
+await viewer.load(data);
+{
+  // start comfortably zoomed in for stylus work
+  const p = viewer.pages[0];
+  const fitW = (scroller.clientWidth - 32) / p.w;
+  viewer.setScale(Math.min(Math.max(fitW * 3, 1.5), 4));
+}
+wakeLock();
+sync.connect(docId);
+window.__writer = { viewer, get gesture() { return gesture; }, get strokes() { return strokes; } };  // TEMP debug
+</script>
+</body>
+</html>

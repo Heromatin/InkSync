@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inksync</title>
+<link rel="icon" type="image/png" href="/img/favicon.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="landing">
+  <h1 class="brand"><img src="/img/logo.png" alt="Inksync"></h1>
+  <p>
+    Pick a PDF to open it on this computer and your phone at the same time —
+    each with its own zoom level, sharing the same center point and live
+    annotations.
+  </p>
+
+  <div class="dropzone" id="dropzone">
+    <p><strong>Drop a PDF here</strong><br>or click to choose a file</p>
+    <input type="file" id="fileinput" accept="application/pdf" hidden>
+  </div>
+
+  <div class="result" id="result">
+    <h3 id="docname"></h3>
+    <p id="existing"></p>
+    <p>
+      <a id="readerlink" href="#">Open reader on this PC →</a>
+    </p>
+    <p style="margin-bottom:4px">On your phone, open:</p>
+    <input class="url-box" id="writerurl" readonly onclick="this.select()">
+  </div>
+</div>
+
+<script>
+const dropzone = document.getElementById("dropzone");
+const fileinput = document.getElementById("fileinput");
+const result = document.getElementById("result");
+
+dropzone.onclick = () => fileinput.click();
+dropzone.ondragover = (e) => { e.preventDefault(); dropzone.classList.add("dragover"); };
+dropzone.ondragleave = () => dropzone.classList.remove("dragover");
+dropzone.ondrop = (e) => {
+  e.preventDefault();
+  dropzone.classList.remove("dragover");
+  if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+};
+fileinput.onchange = () => { if (fileinput.files[0]) upload(fileinput.files[0]); };
+
+async function upload(file) {
+  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+    alert("Please choose a PDF file.");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", file, file.name);
+  const res = await fetch("/upload", { method: "POST", body: form });
+  if (!res.ok) {
+    alert(await res.text());
+    return;
+  }
+  const info = await res.json();
+  document.getElementById("docname").textContent = info.name;
+  document.getElementById("existing").textContent =
+    info.existingAnnotations > 0
+      ? `${info.existingAnnotations} existing annotations found for this document.`
+      : "New document — no annotations yet.";
+  document.getElementById("readerlink").href = `/reader/${info.id}`;
+  document.getElementById("writerurl").value =
+    `${location.protocol}//${location.host}/writer/${info.id}`;
+  result.classList.add("show");
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inksync — Reader</title>
+<link rel="icon" type="image/png" href="/img/favicon.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="toolbar" id="toolbar">
+  <img class="brand-mark" src="/img/logo-mark.png" alt="Inksync" title="Inksync">
+  <button id="zoomout">−</button>
+  <span id="zoomlabel">100%</span>
+  <button id="zoomin">+</button>
+  <button id="fitwidth">Fit width</button>
+  <span class="spacer"></span>
+  <span class="doc-name" id="docname"></span>
+  <span id="pageinfo" style="color:var(--dim);font-size:13px;min-width:70px;text-align:right"></span>
+</div>
+<div id="scroller"></div>
+<div class="status-pill" id="status" hidden></div>
+
+<script type="module">
+import { PdfViewer } from "/static/js/pdf-core.js";
+import { SyncClient, uuid } from "/static/js/sync.js";
+import { loadPdfSource } from "/static/js/idb-cache.js";
+import { drawSegment } from "/static/js/strokes.js";
+
+const docId = location.pathname.split("/").pop();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
+const viewer = new PdfViewer(document.getElementById("scroller"));
+const sync = new SyncClient();
+sync.role = "reader";
+
+const zoomlabel = document.getElementById("zoomlabel");
+const pageinfo = document.getElementById("pageinfo");
+const status = document.getElementById("status");
+
+sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
+
+// full state on join/rejoin
+let strokes = [];
+sync.on("state", ({ strokes: incoming, camera }) => {
+  strokes = incoming;
+  viewer.strokes = strokes;
+  viewer.redrawAllOverlays();
+  if (camera && camera.p) viewer.setCamera(camera);
+});
+
+// reader always follows the shared camera
+sync.on("camera", (cam) => { if (cam.p) viewer.setCamera(cam); });
+
+// live annotations from the writer
+sync.on("stroke", (s) => {
+  const i = strokes.findIndex(x => x.id === s.id || x.tmpId === s.tmpId);
+  if (i >= 0) strokes[i] = s; else strokes.push(s);
+  viewer.redrawPage(s.page);
+});
+sync.on("erase", (ids) => {
+  const set = new Set(ids);
+  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
+  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
+});
+
+// broadcast our own scrolling so the phone follows
+viewer.addEventListener("usercamera", (e) => sync.sendCameraThrottled(e.detail));
+
+// ------------------------------------------------------------------ mouse drawing
+// On the desktop the mouse draws (same page-unit pipeline as the phone);
+// the wheel still scrolls. Touch input on this device is not expected.
+
+const scroller = document.getElementById("scroller");
+const PEN_WIDTH = 2.2;
+let drawing = null;
+
+scroller.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "touch") return;   // touch scrolls via the browser here
+  e.preventDefault();
+  const pt = viewer.pointToPage(e.clientX, e.clientY);
+  if (!pt) return;
+  drawing = {
+    pointerId: e.pointerId,
+    page: pt.p.index,
+    stroke: {
+      tmpId: uuid().slice(0, 8),
+      page: pt.p.index,
+      mode: "pen",
+      color: "#1a1a1a",
+      width: PEN_WIDTH,
+      points: [{ x: pt.x, y: pt.y, p: e.pressure || 0.5 }],
+    },
+  };
+  scroller.setPointerCapture(e.pointerId);
+}, { passive: false });
+
+scroller.addEventListener("pointermove", (e) => {
+  if (!drawing || e.pointerId !== drawing.pointerId) return;
+  const pt = viewer.pointToPage(e.clientX, e.clientY);
+  if (!pt || pt.p.index !== drawing.page) return;
+  const pts = drawing.stroke.points;
+  const last = pts[pts.length - 1];
+  if (Math.hypot(pt.x - last.x, pt.y - last.y) < 0.4) return;
+  pts.push({ x: pt.x, y: pt.y, p: e.pressure || 0.5 });
+  const ctx = viewer.strokeCtx(drawing.page);
+  if (!ctx) return;
+  drawSegment(ctx, drawing.stroke, last, pts[pts.length - 1]);
+});
+
+scroller.addEventListener("pointerup", (e) => {
+  if (!drawing || e.pointerId !== drawing.pointerId) return;
+  const s = drawing.stroke;
+  drawing = null;
+  strokes.push(s);
+  viewer.strokes = strokes;
+  viewer.redrawPage(s.page);
+  sync.sendStroke(s);
+});
+
+viewer.addEventListener("scalechange", () => {
+  zoomlabel.textContent = Math.round(viewer.scale * 100) + "%";
+});
+
+document.getElementById("zoomin").onclick = () => viewer.zoomBy(1.2);
+document.getElementById("zoomout").onclick = () => viewer.zoomBy(1 / 1.2);
+document.getElementById("fitwidth").onclick = () => {
+  const p = viewer.pages[viewer.currentPage() - 1];
+  if (p) viewer.setScale((scroller.clientWidth - 48) / p.w);
+};
+
+setInterval(() => {
+  pageinfo.textContent = `${viewer.currentPage()} / ${viewer.doc ? viewer.doc.numPages : "?"}`;
+}, 250);
+
+const { data } = await loadPdfSource(docId);   // local cache first, network once
+await viewer.load(data);
+{
+  const p = viewer.pages[0];
+  viewer.setScale((scroller.clientWidth - 48) / p.w);
+}
+fetch(`/api/meta/${docId}`).then(r => r.json())
+  .then(m => { document.getElementById("docname").textContent = m.name; })
+  .catch(() => {});
+sync.connect(docId);
+window.__viewer = viewer;   // TEMP debug hook
+</script>
+</body>
+</html>
