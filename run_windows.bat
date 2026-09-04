@@ -1,7 +1,10 @@
 @echo off
 chcp 65001 >nul
-REM Inksync launcher (Windows) — checks requirements, then starts the server.
-REM این فایل را کنار server.py نگه دارید — با دابل‌کلیک اجرا می‌شود
+REM Inksync launcher (Windows) - checks requirements, then starts the server.
+REM Keep this file next to server.py. Persian UI text lives in lang\*.txt
+REM (printed via "type", never inline in this file) because cmd.exe parses
+REM the .bat source using the legacy OEM codepage regardless of chcp,
+REM which corrupts inline non-ASCII text.
 
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -21,11 +24,12 @@ if defined PY goto :havepython
 echo [FAIL] Python 3 was not found on this system.
 echo        Install it from https://www.python.org/downloads/
 echo        IMPORTANT: tick "Add python.exe to PATH" in the installer.
-echo   فارسی: پایتون ۳ نصب نیست — اول آن را نصب کنید.
+if exist "lang\no_python.txt" type "lang\no_python.txt"
 goto :end
 
 :havepython
-echo Checking requirements for Inksync...      بررسی پیش‌نیازها...
+echo Checking requirements for Inksync...
+if exist "lang\checking.txt" type "lang\checking.txt"
 "%PY%" preflight.py --root "%cd%"
 set "RC=%errorlevel%"
 
@@ -46,7 +50,7 @@ if /i "%ANSWER%"=="yes" goto :doinstall
 
 echo Install it manually, then run this file again:
 echo     "%PY%" -m pip install aiohttp
-echo   فارسی: دستی نصب کنید و دوباره اجرا کنید.
+if exist "lang\install_manually.txt" type "lang\install_manually.txt"
 goto :end
 
 :doinstall
@@ -56,14 +60,14 @@ echo Creating virtual environment (.venv)...
 if errorlevel 1 (
     echo [FAIL] Could not create the virtual environment.
     echo        Try manually:  "%PY%" -m pip install aiohttp
-    echo   فارسی: ساخت محیط مجازی ناموفق بود.
+    if exist "lang\venv_fail.txt" type "lang\venv_fail.txt"
     goto :end
 )
 echo Installing aiohttp...
 "%VENV%\Scripts\python.exe" -m pip install aiohttp
 if errorlevel 1 (
     echo [FAIL] Installing aiohttp did not succeed - check your internet connection.
-    echo   فارسی: نصب aiohttp ناموفق بود — اتصال اینترنت را بررسی کنید.
+    if exist "lang\aiohttp_fail.txt" type "lang\aiohttp_fail.txt"
     goto :end
 )
 "%VENV%\Scripts\python.exe" preflight.py --root "%cd%"
@@ -74,22 +78,23 @@ goto :run
 :abort
 echo.
 echo [ABORTED] Fix the problem(s) listed above, then run this file again.
-echo   فارسی: مشکل‌های بالا را رفع کنید و دوباره اجرا کنید.
+if exist "lang\abort.txt" type "lang\abort.txt"
 goto :end
 
 :run
 echo.
 echo Starting Inksync server on http://localhost:8765/   (Ctrl-C to stop)
-echo برای توقف سرور Ctrl-C بزنید
+if exist "lang\ctrlc.txt" type "lang\ctrlc.txt"
 "%PY%" server.py
 set "RC=%errorlevel%"
 echo.
 if "%RC%"=="0" (
-    echo Server stopped.        سرور متوقف شد.
+    echo Server stopped.
+    if exist "lang\stopped.txt" type "lang\stopped.txt"
 ) else (
     echo [FAIL] Inksync exited unexpectedly ^(exit code %RC%^).
     echo        The actual error is printed above - scroll up.
-    echo   فارسی: سرور با خطا متوقف شد — متن خطا بالای همین پیام‌ها است.
+    if exist "lang\server_fail.txt" type "lang\server_fail.txt"
 )
 
 :end
