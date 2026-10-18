@@ -1,0 +1,212 @@
+diff --git a/server.py b/server.py
+index ca406df..0734ade 100644
+--- a/server.py
++++ b/server.py
+@@ -5,9 +5,11 @@ camera/annotation state between devices over WebSockets."""
+ import asyncio
+ import hashlib
+ import json
++import os
+ import socket
+ import subprocess
+ import sys
++import time
+ from pathlib import Path
+ 
+ from aiohttp import web, WSMsgType
+@@ -43,8 +45,19 @@ class DocRoom:
+                 data = json.loads(self.sidecar.read_text())
+                 self.strokes = data.get("strokes", [])
+                 self.camera = data.get("camera")
+-            except (json.JSONDecodeError, OSError):
+-                print(f"[warn] failed to load sidecar for {self.doc_id}")
++            except (json.JSONDecodeError, OSError, AttributeError):
++                # Never let the next save overwrite an unreadable file: keep it
++                # aside so the annotations can still be recovered by hand.
++                backup = self.sidecar.with_name(
++                    f"{self.sidecar.name}.corrupt-{int(time.time())}")
++                try:
++                    os.replace(self.sidecar, backup)
++                    print(f"[warn] unreadable sidecar for {self.doc_id}; "
++                          f"kept as {backup.name}")
++                except OSError:
++                    print(f"[warn] failed to load sidecar for {self.doc_id}")
++                self.strokes = []
++                self.camera = None
+ 
+     def schedule_save(self):
+         if self._save_task:
+@@ -54,12 +67,19 @@ class DocRoom:
+     async def _debounced_save(self):
+         try:
+             await asyncio.sleep(0.5)
+-            self.sidecar.write_text(json.dumps(
++            payload = json.dumps(
+                 {"strokes": self.strokes, "camera": self.camera},
+                 separators=(",", ":"),
+-            ))
++            )
++            # atomic write: a crash mid-write can no longer leave a truncated
++            # sidecar behind (os.replace is atomic on the same filesystem)
++            tmp = self.sidecar.with_name(self.sidecar.name + ".tmp")
++            tmp.write_text(payload)
++            os.replace(tmp, self.sidecar)
+         except asyncio.CancelledError:
+             pass
++        except OSError as exc:
++            print(f"[warn] could not save annotations for {self.doc_id}: {exc}")
+ 
+     def broadcast(self, message: dict, exclude: web.WebSocketResponse | None = None):
+         dead = []
+diff --git a/web/js/sync.js b/web/js/sync.js
+index 40d8da6..cd397e0 100644
+--- a/web/js/sync.js
++++ b/web/js/sync.js
+@@ -27,6 +27,11 @@ export class SyncClient {
+     this.docId = null;
+     this._retry = 0;
+     this._camLastSent = 0;
++    this._gen = 0;            // increments on every (re)connect
++    // strokes sent but not yet echoed back by the server:
++    // tmpId -> { stroke, sentGen }.  Lets us re-send strokes that were drawn
++    // while offline (or lost with a dying connection) after a reconnect.
++    this.pending = new Map();
+   }
+ 
+   on(evt, fn) { (this.handlers[evt] ??= []).push(fn); }
+@@ -39,6 +44,7 @@ export class SyncClient {
+ 
+   _open() {
+     const proto = location.protocol === "https:" ? "wss" : "ws";
++    this._gen++;
+     this.ws = new WebSocket(`${proto}://${location.host}/sync/${this.docId}`);
+     this.ws.onopen = () => {
+       this._retry = 0;
+@@ -48,10 +54,23 @@ export class SyncClient {
+       let msg;
+       try { msg = JSON.parse(e.data); } catch { return; }
+       switch (msg.t) {
+-        case "joined":
+-          this._emit("state", msg);
++        case "joined": {
++          // Merge strokes that the server has never seen (drawn offline or
++          // lost in flight) so a reconnect does not wipe them, and re-send them.
++          const known = new Set(msg.strokes.map(s => s.tmpId).filter(Boolean));
++          const strokes = msg.strokes.slice();
++          for (const [tmpId, entry] of [...this.pending]) {
++            if (known.has(tmpId)) { this.pending.delete(tmpId); continue; }  // server already has it
++            if (entry.sentGen === this._gen) continue;                        // in flight on this connection
++            strokes.push(entry.stroke);
++            if (this.send({ t: "stroke", stroke: entry.stroke })) entry.sentGen = this._gen;
++          }
++          this._emit("state", { ...msg, strokes });
++          this._emit("status", "connected");
+           break;
++        }
+         case "stroke":
++          if (msg.stroke && msg.stroke.tmpId) this.pending.delete(msg.stroke.tmpId);
+           this._emit("stroke", msg.stroke);
+           break;
+         case "erase":
+@@ -71,14 +90,23 @@ export class SyncClient {
+     this.ws.onerror = () => this.ws.close();
+   }
+ 
++  // returns true if the message was actually handed to an open socket
+   send(obj) {
+     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+       this.ws.send(JSON.stringify(obj));
++      return true;
+     }
++    return false;
+   }
+ 
+   sendStroke(stroke) {
+-    this.send({ t: "stroke", stroke });
++    const sent = this.send({ t: "stroke", stroke });
++    if (stroke.tmpId) this.pending.set(stroke.tmpId, { stroke, sentGen: sent ? this._gen : -1 });
++  }
++
++  // a stroke the user erased/undid before the server confirmed it must not be re-sent
++  dropPending(tmpIds) {
++    for (const id of tmpIds) this.pending.delete(id);
+   }
+ 
+   sendErase(ids) {
+diff --git a/web/reader.html b/web/reader.html
+index d16ed17..981b2d4 100644
+--- a/web/reader.html
++++ b/web/reader.html
+@@ -39,7 +39,10 @@ const zoomlabel = document.getElementById("zoomlabel");
+ const pageinfo = document.getElementById("pageinfo");
+ const status = document.getElementById("status");
+ 
+-sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
++sync.on("status", (s) => {
++  status.hidden = (s === "connected");
++  if (s !== "connected") status.textContent = "Reconnecting…";
++});
+ 
+ // full state on join/rejoin
+ let strokes = [];
+@@ -61,8 +64,12 @@ sync.on("stroke", (s) => {
+ });
+ sync.on("erase", (ids) => {
+   const set = new Set(ids);
+-  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
+-  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
++  const pages = new Set();
++  // remove first, redraw after: redrawing before the splice repaints the erased ink
++  for (let i = strokes.length - 1; i >= 0; i--) {
++    if (set.has(strokes[i].id)) { pages.add(strokes[i].page); strokes.splice(i, 1); }
++  }
++  for (const pg of pages) viewer.redrawPage(pg);
+ });
+ 
+ // broadcast our own scrolling so the phone follows
+diff --git a/web/writer.html b/web/writer.html
+index 13b2b42..cc4a863 100644
+--- a/web/writer.html
++++ b/web/writer.html
+@@ -72,8 +72,12 @@ sync.on("stroke", applyRemoteStroke);
+ 
+ sync.on("erase", (ids) => {
+   const set = new Set(ids);
+-  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
+-  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
++  const pages = new Set();
++  // remove first, redraw after: redrawing before the splice repaints the erased ink
++  for (let i = strokes.length - 1; i >= 0; i--) {
++    if (set.has(strokes[i].id)) { pages.add(strokes[i].page); strokes.splice(i, 1); }
++  }
++  for (const pg of pages) viewer.redrawPage(pg);
+ });
+ 
+ sync.on("camera", (cam) => {
+@@ -116,6 +120,7 @@ document.getElementById("undo").onclick = () => {
+   strokes = strokes.filter(s => s !== mine);
+   viewer.strokes = strokes;
+   viewer.redrawPage(mine.page);
++  if (mine.tmpId) sync.dropPending([mine.tmpId]);
+   sync.undo();
+ };
+ 
+@@ -347,13 +352,17 @@ function eraseAt(e) {
+   }
+   viewer.strokes = strokes;
+   viewer.redrawPage(pt.p.index);
++  sync.dropPending(hits.map(h => h.tmpId).filter(Boolean));
+   if (ids.length) sync.sendErase(ids);
+ }
+ 
+ // ------------------------------------------------------------------ misc
+ 
+ const status = document.getElementById("status");
+-sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
++sync.on("status", (s) => {
++  status.hidden = (s === "connected");
++  if (s !== "connected") status.textContent = "Reconnecting…";
++});
+ 
+ async function wakeLock() {
+   try { await navigator.wakeLock.request("screen"); } catch {}

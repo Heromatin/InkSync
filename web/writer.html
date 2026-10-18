@@ -72,8 +72,12 @@ sync.on("stroke", applyRemoteStroke);
 
 sync.on("erase", (ids) => {
   const set = new Set(ids);
-  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
-  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
+  const pages = new Set();
+  // remove first, redraw after: redrawing before the splice repaints the erased ink
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    if (set.has(strokes[i].id)) { pages.add(strokes[i].page); strokes.splice(i, 1); }
+  }
+  for (const pg of pages) viewer.redrawPage(pg);
 });
 
 sync.on("camera", (cam) => {
@@ -116,6 +120,7 @@ document.getElementById("undo").onclick = () => {
   strokes = strokes.filter(s => s !== mine);
   viewer.strokes = strokes;
   viewer.redrawPage(mine.page);
+  if (mine.tmpId) sync.dropPending([mine.tmpId]);
   sync.undo();
 };
 
@@ -347,13 +352,17 @@ function eraseAt(e) {
   }
   viewer.strokes = strokes;
   viewer.redrawPage(pt.p.index);
+  sync.dropPending(hits.map(h => h.tmpId).filter(Boolean));
   if (ids.length) sync.sendErase(ids);
 }
 
 // ------------------------------------------------------------------ misc
 
 const status = document.getElementById("status");
-sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
+sync.on("status", (s) => {
+  status.hidden = (s === "connected");
+  if (s !== "connected") status.textContent = "Reconnecting…";
+});
 
 async function wakeLock() {
   try { await navigator.wakeLock.request("screen"); } catch {}

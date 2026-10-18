@@ -27,6 +27,11 @@ export class SyncClient {
     this.docId = null;
     this._retry = 0;
     this._camLastSent = 0;
+    this._gen = 0;            // increments on every (re)connect
+    // strokes sent but not yet echoed back by the server:
+    // tmpId -> { stroke, sentGen }.  Lets us re-send strokes that were drawn
+    // while offline (or lost with a dying connection) after a reconnect.
+    this.pending = new Map();
   }
 
   on(evt, fn) { (this.handlers[evt] ??= []).push(fn); }
@@ -39,6 +44,7 @@ export class SyncClient {
 
   _open() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
+    this._gen++;
     this.ws = new WebSocket(`${proto}://${location.host}/sync/${this.docId}`);
     this.ws.onopen = () => {
       this._retry = 0;
@@ -48,10 +54,23 @@ export class SyncClient {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       switch (msg.t) {
-        case "joined":
-          this._emit("state", msg);
+        case "joined": {
+          // Merge strokes that the server has never seen (drawn offline or
+          // lost in flight) so a reconnect does not wipe them, and re-send them.
+          const known = new Set(msg.strokes.map(s => s.tmpId).filter(Boolean));
+          const strokes = msg.strokes.slice();
+          for (const [tmpId, entry] of [...this.pending]) {
+            if (known.has(tmpId)) { this.pending.delete(tmpId); continue; }  // server already has it
+            if (entry.sentGen === this._gen) continue;                        // in flight on this connection
+            strokes.push(entry.stroke);
+            if (this.send({ t: "stroke", stroke: entry.stroke })) entry.sentGen = this._gen;
+          }
+          this._emit("state", { ...msg, strokes });
+          this._emit("status", "connected");
           break;
+        }
         case "stroke":
+          if (msg.stroke && msg.stroke.tmpId) this.pending.delete(msg.stroke.tmpId);
           this._emit("stroke", msg.stroke);
           break;
         case "erase":
@@ -71,14 +90,23 @@ export class SyncClient {
     this.ws.onerror = () => this.ws.close();
   }
 
+  // returns true if the message was actually handed to an open socket
   send(obj) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(obj));
+      return true;
     }
+    return false;
   }
 
   sendStroke(stroke) {
-    this.send({ t: "stroke", stroke });
+    const sent = this.send({ t: "stroke", stroke });
+    if (stroke.tmpId) this.pending.set(stroke.tmpId, { stroke, sentGen: sent ? this._gen : -1 });
+  }
+
+  // a stroke the user erased/undid before the server confirmed it must not be re-sent
+  dropPending(tmpIds) {
+    for (const id of tmpIds) this.pending.delete(id);
   }
 
   sendErase(ids) {

@@ -39,7 +39,10 @@ const zoomlabel = document.getElementById("zoomlabel");
 const pageinfo = document.getElementById("pageinfo");
 const status = document.getElementById("status");
 
-sync.on("status", (s) => { status.hidden = false; status.textContent = "Reconnecting…"; });
+sync.on("status", (s) => {
+  status.hidden = (s === "connected");
+  if (s !== "connected") status.textContent = "Reconnecting…";
+});
 
 // full state on join/rejoin
 let strokes = [];
@@ -61,8 +64,12 @@ sync.on("stroke", (s) => {
 });
 sync.on("erase", (ids) => {
   const set = new Set(ids);
-  for (const s of strokes.filter(x => set.has(x.id))) viewer.redrawPage(s.page);
-  for (let i = strokes.length - 1; i >= 0; i--) if (set.has(strokes[i].id)) strokes.splice(i, 1);
+  const pages = new Set();
+  // remove first, redraw after: redrawing before the splice repaints the erased ink
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    if (set.has(strokes[i].id)) { pages.add(strokes[i].page); strokes.splice(i, 1); }
+  }
+  for (const pg of pages) viewer.redrawPage(pg);
 });
 
 // broadcast our own scrolling so the phone follows

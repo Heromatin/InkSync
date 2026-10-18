@@ -5,9 +5,11 @@ camera/annotation state between devices over WebSockets."""
 import asyncio
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from aiohttp import web, WSMsgType
@@ -43,8 +45,19 @@ class DocRoom:
                 data = json.loads(self.sidecar.read_text())
                 self.strokes = data.get("strokes", [])
                 self.camera = data.get("camera")
-            except (json.JSONDecodeError, OSError):
-                print(f"[warn] failed to load sidecar for {self.doc_id}")
+            except (json.JSONDecodeError, OSError, AttributeError):
+                # Never let the next save overwrite an unreadable file: keep it
+                # aside so the annotations can still be recovered by hand.
+                backup = self.sidecar.with_name(
+                    f"{self.sidecar.name}.corrupt-{int(time.time())}")
+                try:
+                    os.replace(self.sidecar, backup)
+                    print(f"[warn] unreadable sidecar for {self.doc_id}; "
+                          f"kept as {backup.name}")
+                except OSError:
+                    print(f"[warn] failed to load sidecar for {self.doc_id}")
+                self.strokes = []
+                self.camera = None
 
     def schedule_save(self):
         if self._save_task:
@@ -54,12 +67,19 @@ class DocRoom:
     async def _debounced_save(self):
         try:
             await asyncio.sleep(0.5)
-            self.sidecar.write_text(json.dumps(
+            payload = json.dumps(
                 {"strokes": self.strokes, "camera": self.camera},
                 separators=(",", ":"),
-            ))
+            )
+            # atomic write: a crash mid-write can no longer leave a truncated
+            # sidecar behind (os.replace is atomic on the same filesystem)
+            tmp = self.sidecar.with_name(self.sidecar.name + ".tmp")
+            tmp.write_text(payload)
+            os.replace(tmp, self.sidecar)
         except asyncio.CancelledError:
             pass
+        except OSError as exc:
+            print(f"[warn] could not save annotations for {self.doc_id}: {exc}")
 
     def broadcast(self, message: dict, exclude: web.WebSocketResponse | None = None):
         dead = []
