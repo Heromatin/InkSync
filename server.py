@@ -5,14 +5,16 @@ camera/annotation state between devices over WebSockets."""
 import asyncio
 import hashlib
 import json
+import math
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSCloseCode, WSMsgType
 
 ROOT = Path(__file__).parent
 WEB = ROOT / "web"
@@ -24,6 +26,16 @@ PORT = 8765
 
 def doc_id_for(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
+
+
+DOC_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def known_doc(doc_id: str) -> bool:
+    """True only for a well-formed id (12 hex chars) whose PDF exists.
+    Everything that builds a path from a URL segment goes through this, so a
+    crafted id (e.g. '..%2Fx') can never reach the filesystem."""
+    return bool(DOC_ID_RE.fullmatch(doc_id)) and (DOCS / f"{doc_id}.pdf").is_file()
 
 
 class DocRoom:
@@ -64,22 +76,34 @@ class DocRoom:
             self._save_task.cancel()
         self._save_task = asyncio.get_event_loop().create_task(self._debounced_save())
 
+    def _write(self):
+        payload = json.dumps(
+            {"strokes": self.strokes, "camera": self.camera},
+            separators=(",", ":"),
+        )
+        # atomic write: a crash mid-write can no longer leave a truncated
+        # sidecar behind (os.replace is atomic on the same filesystem)
+        tmp = self.sidecar.with_name(self.sidecar.name + ".tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, self.sidecar)
+
     async def _debounced_save(self):
         try:
             await asyncio.sleep(0.5)
-            payload = json.dumps(
-                {"strokes": self.strokes, "camera": self.camera},
-                separators=(",", ":"),
-            )
-            # atomic write: a crash mid-write can no longer leave a truncated
-            # sidecar behind (os.replace is atomic on the same filesystem)
-            tmp = self.sidecar.with_name(self.sidecar.name + ".tmp")
-            tmp.write_text(payload)
-            os.replace(tmp, self.sidecar)
+            self._write()
         except asyncio.CancelledError:
             pass
         except OSError as exc:
             print(f"[warn] could not save annotations for {self.doc_id}: {exc}")
+
+    def flush(self):
+        """Write a still-pending debounced save right now (used on shutdown)."""
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+            try:
+                self._write()
+            except OSError as exc:
+                print(f"[warn] could not save annotations for {self.doc_id}: {exc}")
 
     def broadcast(self, message: dict, exclude: web.WebSocketResponse | None = None):
         dead = []
@@ -127,10 +151,14 @@ async def page(request):
 
 
 async def reader_page(request):
+    if not known_doc(request.match_info["doc_id"]):
+        raise web.HTTPNotFound
     return web.FileResponse(WEB / "reader.html")
 
 
 async def writer_page(request):
+    if not known_doc(request.match_info["doc_id"]):
+        raise web.HTTPNotFound
     return web.FileResponse(WEB / "writer.html")
 
 
@@ -175,9 +203,9 @@ async def upload(request):
 
 async def serve_pdf(request):
     doc_id = Path(request.match_info["name"]).stem
-    pdf_path = DOCS / f"{doc_id}.pdf"
-    if not pdf_path.exists():
+    if not known_doc(doc_id):
         raise web.HTTPNotFound
+    pdf_path = DOCS / f"{doc_id}.pdf"
     return web.FileResponse(
         pdf_path,
         headers={"Cache-Control": "max-age=31536000, immutable"},
@@ -186,8 +214,7 @@ async def serve_pdf(request):
 
 async def doc_meta(request):
     doc_id = request.match_info["doc_id"]
-    pdf_path = DOCS / f"{doc_id}.pdf"
-    if not pdf_path.exists():
+    if not known_doc(doc_id):
         raise web.HTTPNotFound
     meta_path = DOCS / f"{doc_id}.meta.json"
     name = "document.pdf"
@@ -202,14 +229,73 @@ async def doc_meta(request):
 
 # ---------------------------------------------------------------- WebSocket
 
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+async def _handle_message(room: DocRoom, ws: web.WebSocketResponse, session: dict, data: dict):
+    t = data.get("t")
+
+    if t == "join":
+        cid, role = data.get("clientId"), data.get("role")
+        session["client_id"] = cid if isinstance(cid, str) and len(cid) <= 64 else None
+        session["role"] = role if isinstance(role, str) and len(role) <= 32 else None
+        await ws.send_json({
+            "t": "joined",
+            "you": session["client_id"],
+            "strokes": room.strokes,
+            "camera": room.camera,
+        })
+    elif t == "stroke":
+        stroke = data.get("stroke")
+        # a malformed stroke would be persisted and then break rendering on
+        # every device that opens the document, so reject it here
+        if not (isinstance(stroke, dict) and isinstance(stroke.get("points"), list)
+                and isinstance(stroke.get("page"), int)):
+            return
+        sid = stroke.get("id")
+        if not isinstance(sid, str) or not sid:
+            sid = hashlib.sha256(
+                json.dumps(stroke, sort_keys=True).encode()
+            ).hexdigest()[:12]
+        stroke["id"] = sid
+        stroke["author"] = session["client_id"]
+        room.strokes.append(stroke)
+        room.schedule_save()
+        room.broadcast({"t": "stroke", "stroke": stroke})
+    elif t == "erase":
+        raw = data.get("ids")
+        if not isinstance(raw, list):
+            return
+        ids = {i for i in raw if isinstance(i, str)}
+        room.strokes = [s for s in room.strokes if s.get("id") not in ids]
+        room.schedule_save()
+        room.broadcast({"t": "erase", "ids": list(ids)}, exclude=ws)
+    elif t == "undo":
+        for i in range(len(room.strokes) - 1, -1, -1):
+            if room.strokes[i].get("author") == session["client_id"]:
+                removed = room.strokes.pop(i)
+                room.schedule_save()
+                room.broadcast({"t": "erase", "ids": [removed.get("id")]})
+                break
+    elif t == "camera" and session["role"] != "observer":
+        p, fx, fy = data.get("p"), data.get("fx"), data.get("fy")
+        if not (_num(p) and (fx is None or _num(fx)) and (fy is None or _num(fy))):
+            return
+        room.camera = {"p": p, "fy": fy, "fx": fx}
+        room.schedule_save()
+        room.broadcast({"t": "camera", **room.camera}, exclude=ws)
+
+
 async def sync_ws(request):
     doc_id = request.match_info["doc_id"]
+    if not known_doc(doc_id):
+        raise web.HTTPNotFound
     room = get_room(doc_id)
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
-    client_id = None
-    role = None
+    session = {"client_id": None, "role": None}
     room.clients.add(ws)
     try:
         await ws.send_json({
@@ -225,47 +311,24 @@ async def sync_ws(request):
                 data = json.loads(msg.data)
             except json.JSONDecodeError:
                 continue
-            t = data.get("t")
-
-            if t == "join":
-                client_id = data.get("clientId")
-                role = data.get("role")
-                await ws.send_json({
-                    "t": "joined",
-                    "you": client_id,
-                    "strokes": room.strokes,
-                    "camera": room.camera,
-                })
-            elif t == "stroke":
-                stroke = data.get("stroke", {})
-                stroke["id"] = stroke.get("id") or hashlib.sha256(
-                    json.dumps(stroke, sort_keys=True).encode()
-                ).hexdigest()[:12]
-                stroke["author"] = client_id
-                room.strokes.append(stroke)
-                room.schedule_save()
-                room.broadcast({"t": "stroke", "stroke": stroke})
-            elif t == "erase":
-                ids = set(data.get("ids", []))
-                room.strokes = [s for s in room.strokes if s.get("id") not in ids]
-                room.schedule_save()
-                room.broadcast({"t": "erase", "ids": list(ids)}, exclude=ws)
-            elif t == "undo":
-                for i in range(len(room.strokes) - 1, -1, -1):
-                    if room.strokes[i].get("author") == client_id:
-                        removed = room.strokes.pop(i)
-                        room.schedule_save()
-                        room.broadcast({"t": "erase", "ids": [removed["id"]]})
-                        break
-            elif t == "camera" and role != "observer":
-                room.camera = {
-                    "p": data.get("p"), "fy": data.get("fy"), "fx": data.get("fx"),
-                }
-                room.schedule_save()
-                room.broadcast(data, exclude=ws)
+            if not isinstance(data, dict):
+                continue
+            try:
+                await _handle_message(room, ws, session, data)
+            except Exception as exc:  # one bad message must never kill the connection
+                print(f"[warn] ignored bad {data.get('t')!r} message: {exc!r}")
     finally:
         room.clients.discard(ws)
     return ws
+
+
+async def _on_shutdown(_app):
+    """Ctrl+C: save what is pending and close every WebSocket, otherwise aiohttp
+    waits (up to its shutdown timeout) for browsers that never hang up."""
+    for room in list(ROOMS.values()):
+        room.flush()
+        for ws in list(room.clients):
+            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutting down")
 
 
 # ---------------------------------------------------------------- startup
@@ -308,6 +371,7 @@ def lan_ips():
 
 def main():
     app = web.Application(client_max_size=2 * 1024**3)
+    app.on_shutdown.append(_on_shutdown)
     app.router.add_get("/", index)
     app.router.add_get("/sw.js", service_worker)
     app.router.add_get("/manifest.json", manifest)

@@ -210,14 +210,25 @@ export class PdfViewer extends EventTarget {
       if (!this.pages.length) return;
 
       const [viewTop, viewBot] = this._visibleRange();
-      const needed = [];
+      const vTop = this.scrollEl.scrollTop, vBot = vTop + this.scrollEl.clientHeight;
+      // distance (CSS px) from a page to the actual viewport; 0 = on screen
+      const dist = (p) => {
+        const bot = p.top + p.h * this.scale;
+        return bot <= vTop ? vTop - bot : p.top >= vBot ? p.top - vBot : 0;
+      };
+      const candidates = [];
       for (const p of this.pages) {
         const bot = p.top + p.h * this.scale;
-        if (bot > viewTop && p.top < viewBot) {
-          needed.push(p);
-          if (needed.length >= POOL_LIMIT) break;
-        }
+        if (bot > viewTop && p.top < viewBot) candidates.push(p);
       }
+      // Pages on screen ALWAYS get a canvas (when zoomed out there can be more
+      // than POOL_LIMIT of them, but they are small, so memory stays bounded by
+      // the viewport area). The remaining slots go to the nearest off-screen
+      // pages — not simply the first ones in document order.
+      candidates.sort((a, b) => dist(a) - dist(b));
+      let onScreen = 0;
+      while (onScreen < candidates.length && dist(candidates[onScreen]) === 0) onScreen++;
+      const needed = candidates.slice(0, Math.max(POOL_LIMIT, onScreen));
       const neededSet = new Set(needed.map(p => p.index));
 
       for (const idx of [...this._pooled]) {
