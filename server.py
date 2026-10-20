@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from aiohttp import web, WSCloseCode, WSMsgType
@@ -253,13 +254,18 @@ async def _handle_message(room: DocRoom, ws: web.WebSocketResponse, session: dic
         if not (isinstance(stroke, dict) and isinstance(stroke.get("points"), list)
                 and isinstance(stroke.get("page"), int)):
             return
-        sid = stroke.get("id")
-        if not isinstance(sid, str) or not sid:
-            sid = hashlib.sha256(
-                json.dumps(stroke, sort_keys=True).encode()
-            ).hexdigest()[:12]
-        stroke["id"] = sid
-        stroke["author"] = session["client_id"]
+        author, tmp = session["client_id"], stroke.get("tmpId")
+        if author and isinstance(tmp, str):
+            for old in reversed(room.strokes):
+                if old.get("author") == author and old.get("tmpId") == tmp:
+                    # the same stroke arriving twice (re-sent after a reconnect):
+                    # do not store it again, just confirm the existing one
+                    await ws.send_json({"t": "stroke", "stroke": old})
+                    return
+        # ids are always assigned here: a client-supplied (or content-derived) id
+        # could collide, and one erase would then remove several strokes
+        stroke["id"] = uuid.uuid4().hex[:12]
+        stroke["author"] = author
         room.strokes.append(stroke)
         room.schedule_save()
         room.broadcast({"t": "stroke", "stroke": stroke})

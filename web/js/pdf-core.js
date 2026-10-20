@@ -438,14 +438,19 @@ export class PdfViewer extends EventTarget {
   }
 
   _onScroll() {
+    // Camera first, and on EVERY scroll event: this used to sit behind the render
+    // throttle below, so everything after the first event of a burst - including
+    // the position where the scroll stopped - was never reported. The consumer
+    // (SyncClient.sendCameraThrottled) does the rate limiting and always sends
+    // the newest position.
+    if (Date.now() >= this._suppressUntil) {
+      const cam = this.getCamera();
+      if (cam) this.dispatchEvent(new CustomEvent("usercamera", { detail: cam }));
+    }
     if (this._scrollThrottle) return;
     this._scrollThrottle = setTimeout(() => {
       this._scrollThrottle = null;
       this.rerenderVisible();
     }, 120);
-    if (Date.now() >= this._suppressUntil) {
-      const cam = this.getCamera();
-      if (cam) this.dispatchEvent(new CustomEvent("usercamera", { detail: cam }));
-    }
   }
 }

@@ -21,8 +21,8 @@ Design idea: the computer provides the document, each client renders it locally,
 - **Device-independent positioning** — annotations are stored in PDF page coordinates, not screen coordinates, so strokes stay anchored across zoom levels and devices.
 - **Optimized zoom rendering** — existing bitmaps are scaled during active gestures, high-quality render happens after the gesture settles, and only near-viewport pages stay rendered.
 - **Undo/erase** — undo removes the calling author's last stroke; eraser removes strokes via hit-testing.
-- **Auto-reconnect** — WebSocket reconnects automatically with exponential backoff.
-- **Wake Lock** — keeps the writer's screen awake during a session, where supported.
+- **Auto-reconnect** — WebSocket reconnects automatically (retry delay grows from 1 s up to 5 s). Strokes drawn while offline are kept and re-sent after the connection returns.
+- **Wake Lock** — keeps the writer's screen awake during a session, but browsers only allow this on HTTPS or `localhost`. On the normal plain-`http://<LAN-IP>` setup it is **not available**, so turn off the phone's screen timeout while writing.
 - **Multiple writers** — more than one writing client can join the same document room.
 - **E2E tests** — cover touch gestures, stylus drawing, cross-device coordinates, and rendering regressions.
 
@@ -241,7 +241,9 @@ Browser-based E2E tests (via Chrome DevTools Protocol) cover touch gesture class
 - No text or shape annotation tools.
 - A stroke stays tied to the page it started on.
 - Undo only covers the requesting author's most recent stroke.
-- Reader-side touch input is intentionally not used for drawing.
+- Reader-side touch input is intentionally not used for drawing (a finger drag scrolls the document natively; there is no pinch-zoom on the reader — use the zoom buttons).
+- Documents in `docs/` must be named `<12 hex characters>.pdf` (what the upload creates); other file names are ignored.
+- Undo/erase done while offline are not synced: the stroke comes back from the server on reconnect.
 
 ## Roadmap
 

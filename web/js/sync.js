@@ -27,6 +27,8 @@ export class SyncClient {
     this.docId = null;
     this._retry = 0;
     this._camLastSent = 0;
+    this._camPending = null;   // newest throttled camera position not yet sent
+    this._camTimer = null;
     this._gen = 0;            // increments on every (re)connect
     // strokes sent but not yet echoed back by the server:
     // tmpId -> { stroke, sentGen }.  Lets us re-send strokes that were drawn
@@ -92,6 +94,7 @@ export class SyncClient {
 
   // returns true if the message was actually handed to an open socket
   send(obj) {
+    if (obj.t === "camera") this._cancelPendingCamera();   // a direct send is the newest position
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(obj));
       return true;
@@ -117,10 +120,33 @@ export class SyncClient {
     this.send({ t: "undo" });
   }
 
+  // At most one camera message per interval, but the NEWEST position is never
+  // dropped: if updates arrive inside the interval, the latest one is sent when
+  // it ends, so the other device always ends up where the scrolling stopped.
   sendCameraThrottled(cam, minIntervalMs = 60) {
-    const now = performance.now();
-    if (now - this._camLastSent < minIntervalMs) return;
-    this._camLastSent = now;
+    const wait = minIntervalMs - (performance.now() - this._camLastSent);
+    if (wait > 0) {
+      this._camPending = cam;
+      if (!this._camTimer) this._camTimer = setTimeout(() => this._flushCamera(), wait);
+      return;
+    }
+    this._sendCameraNow(cam);
+  }
+
+  _sendCameraNow(cam) {
+    this._camLastSent = performance.now();
     this.send({ t: "camera", ...cam });
+  }
+
+  _flushCamera() {
+    this._camTimer = null;
+    const cam = this._camPending;
+    this._camPending = null;
+    if (cam) this._sendCameraNow(cam);
+  }
+
+  _cancelPendingCamera() {
+    if (this._camTimer) { clearTimeout(this._camTimer); this._camTimer = null; }
+    this._camPending = null;
   }
 }

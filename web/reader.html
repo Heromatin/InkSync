@@ -8,6 +8,11 @@
 <link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.json">
 <link rel="stylesheet" href="/static/css/style.css">
+<style>
+  /* style.css sets touch-action:none (the writer handles gestures itself). The reader never
+     draws with touch, so let the browser scroll natively, with momentum. */
+  #scroller { touch-action: pan-x pan-y; }
+</style>
 </head>
 <body>
 <div class="toolbar" id="toolbar">
@@ -84,7 +89,8 @@ const PEN_WIDTH = 2.2;
 let drawing = null;
 
 scroller.addEventListener("pointerdown", (e) => {
-  if (e.pointerType === "touch") return;   // touch scrolls via the browser here
+  if (e.pointerType === "touch") return;   // touch scrolls natively (touch-action below), never draws
+  if (e.pointerType === "mouse" && e.button !== 0) return;   // right/middle click must not draw
   e.preventDefault();
   const pt = viewer.pointToPage(e.clientX, e.clientY);
   if (!pt) return;
